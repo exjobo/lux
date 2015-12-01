@@ -24,10 +24,12 @@
 
 -record(cstate,
         {orig_file               :: string(),
+         rev_file                :: string(),
          parent                  :: pid(),
          name                    :: string(),
          latest_cmd              :: #cmd{},
          cmd_stack = []          :: [{string(), non_neg_integer(), atom()}],
+         break_pos               :: undefined | #cmd_pos{},
          wait_for_expect         :: undefined | pid(),
          mode = resume           :: resume | suspend,
          start_reason            :: fail | success | normal,
@@ -50,6 +52,7 @@
          waiting = false         :: boolean(),
          fail                    :: undefined | #pattern{},
          success                 :: undefined | #pattern{},
+         break                   :: undefined | #pattern{},
          expected                :: undefined | #cmd{},
          pre_expected = []       :: [#cmd{}],
          actual = <<>>           :: binary(),
@@ -71,15 +74,18 @@
 
 start_monitor(I, Cmd, Name, ExtraLogs) ->
     OrigFile = I#istate.orig_file,
+    RevFile = lux_utils:filename_split(OrigFile),
     Self = self(),
     Base = filename:basename(OrigFile),
     Prefix = filename:join([I#istate.case_log_dir, Base ++ "." ++ Name]),
     C = #cstate{orig_file = OrigFile,
+                rev_file = RevFile,
                 parent = Self,
                 name = Name,
                 start_reason = I#istate.cleanup_reason,
                 latest_cmd = Cmd,
                 cmd_stack = I#istate.cmd_stack,
+                break_pos = break_pos(RevFile, I#istate.break_cmd),
                 progress = I#istate.progress,
                 log_fun = I#istate.log_fun,
                 event_log_fd = I#istate.event_log_fd,
@@ -108,6 +114,14 @@ start_monitor(I, Cmd, Name, ExtraLogs) ->
         {'DOWN', _, process, Pid, Reason} ->
             {error, I, Pid, Reason}
     end.
+
+break_pos(_RevFile, undefined) ->
+    undefined;
+break_pos(RevFile, #break_cmd{cmd = Cmd} = BreakCmd) ->
+    #cmd_pos{rev_file  = RevFile,
+             lineno    = Cmd#cmd.lineno,
+             type      = Cmd#cmd.type,
+             break_cmd = BreakCmd}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Server
@@ -213,8 +227,10 @@ shell_wait_for_event(#cstate{name = _Name} = C, OrigC) ->
         {sync, From, When} ->
             C2 = opt_sync_reply(C, From, When),
             shell_wait_for_event(C2, OrigC);
-        {switch_cmd, From, _When, NewCmd, CmdStack, Fun} ->
-            C2 = switch_cmd(C, From, NewCmd, CmdStack, Fun),
+        {switch_cmd, From, _When, NewCmd, CmdStack,
+         NewBreakCmd, NewRevCmdFile, Fun} ->
+            C2 = switch_cmd(C, From, NewCmd, CmdStack,
+                            NewBreakCmd, NewRevCmdFile, Fun),
             shell_wait_for_event(C2, OrigC);
         {change_mode, From, Mode, Cmd, CmdStack}
           when Mode =:= resume; Mode =:= suspend ->
@@ -303,10 +319,13 @@ timeout(C) ->
             IdleThreshold
     end.
 
-switch_cmd(C, From, NewCmd, CmdStack, Fun) ->
+switch_cmd(C, From, NewCmd, CmdStack, NewBreakCmd, NewRevCmdFile, Fun) ->
     Fun(),
     send_reply(C, From, {switch_cmd_ack, self()}),
-    C#cstate{latest_cmd = NewCmd, cmd_stack = CmdStack}.
+    C#cstate{rev_file = NewRevCmdFile,
+             latest_cmd = NewCmd,
+             cmd_stack = CmdStack,
+             break_pos = break_pos(NewRevCmdFile, NewBreakCmd)}.
 
 change_mode(C, From, Mode, Cmd, CmdStack) ->
     Reply = {change_mode_ack, self()},
@@ -342,8 +361,10 @@ block(C, From, OrigC) ->
         {sync, From, When} ->
             C2 = opt_sync_reply(C, From, When),
             block(C2, From, OrigC);
-        {switch_cmd, From, _When, NewCmd, CmdStack, Fun} ->
-            C2 = switch_cmd(C, From, NewCmd, CmdStack, Fun),
+        {switch_cmd, From, _When, NewCmd, CmdStack,
+         NewBreakCmd, NewRevCmdFile, Fun} ->
+            C2 = switch_cmd(C, From, NewCmd, CmdStack,
+                            NewBreakCmd, NewRevCmdFile, Fun),
             block(C2, From, OrigC);
         {'DOWN', _, process, Pid, Reason} when Pid =:= C#cstate.parent ->
             interpreter_died(C, Reason);
@@ -497,6 +518,17 @@ shell_eval(#cstate{name = Name} = C0,
             clog(C, success, "pattern ~p", [lux_utils:to_string(RegExp)]),
             Pattern = #pattern{cmd = Cmd, cmd_stack = C#cstate.cmd_stack},
             C#cstate{state_changed = true, success = Pattern};
+        break when Arg =:= reset ->
+            clog(C, break, "pattern ~p", [Arg]),
+            C#cstate{state_changed = true, break_pos = undefined};
+        break ->
+            single = element(2, Arg), % Assert
+            RegExp = extract_regexp(Arg),
+            clog(C, break, "pattern ~p", [lux_utils:to_string(RegExp)]),
+            BreakCmd = #break_cmd{shell_name = C#cstate.name, cmd = Cmd},
+            BreakPos = break_pos(C#cstate.rev_file, BreakCmd),
+            io:format("\nBREAK ~p\n", [BreakPos]),
+            C#cstate{state_changed = true, break_pos = BreakPos};
         sleep ->
             Secs = Arg,
             clog(C, sleep, "(~p seconds)", [Secs]),
@@ -777,11 +809,13 @@ do_log_multi(_C, _Actual, [], _Context) ->
     ok.
 
 match_patterns(C, Actual) ->
-    C2 = match_fail_pattern(C, Actual),
-    C3 = match_success_pattern(C2, Actual),
-    C3#cstate{state_changed = false}.
+    C2 = lists:foldl(fun match_pattern/2,
+                     C#cstate{actual = Actual},
+                     [fail, success, break_pos, break_stack]),
+    C2#cstate{state_changed = false}.
 
-match_fail_pattern(C, Actual) ->
+match_pattern(fail, C) ->
+    Actual = C#cstate.actual,
     {Res, _Multi} = match(Actual, C#cstate.fail),
     case Res of
         {match, Matches} ->
@@ -798,9 +832,9 @@ match_fail_pattern(C, Actual) ->
                                 "Reason:\n\t~p\n",
                                 [RegExp, Reason]),
             stop(C, error, iolist_to_binary(Err))
-    end.
-
-match_success_pattern(C, Actual) ->
+    end;
+match_pattern(success, C) ->
+    Actual = C#cstate.actual,
     {Res, _Multi} = match(Actual, C#cstate.success),
     case Res of
         {match, Matches} ->
@@ -817,7 +851,54 @@ match_success_pattern(C, Actual) ->
                                 "Reason:\n\t~p\n",
                                 [RegExp, Reason]),
             stop(C, error, iolist_to_binary(Err))
-    end.
+    end;
+match_pattern(break_pos, C) ->
+    Pos = C#cstate.break_pos,
+    {C2, NewPos} = do_match_break_pattern(C, Pos, C#cstate.cmd_stack),
+    C2#cstate{break_pos = NewPos};
+match_pattern(break_stack, C) ->
+    {C2, NewStack} = match_break_patterns(C, C#cstate.cmd_stack, []),
+    C2#cstate{cmd_stack = NewStack}.
+
+match_break_patterns(C, [Pos | Stack], Acc) ->
+    {C2, Pos2} = do_match_break_pattern(C, Pos, Stack),
+    match_break_patterns(C2, Stack, [Pos2 | Acc]);
+match_break_patterns(C, [], Acc) ->
+    {C, lists:reverse(Acc)}.
+
+do_match_break_pattern(C, Pos, Stack)
+  when Pos#cmd_pos.break_cmd#break_cmd.shell_name =:= C#cstate.name ->
+    Actual = C#cstate.actual,
+    Cmd = Pos#cmd_pos.break_cmd#break_cmd.cmd,
+    {Res, _Multi} = match(Actual, Cmd),
+    case Res of
+        {match, [{First, TotLen} | _SubMatches]} ->
+            {Skip, Match, Rest} = split_total(Actual, First, TotLen, undefined),
+            clog(C, skip, "\"~s\"", [lux_utils:to_string(Skip)]),
+            Context = <<"break pattern matched ">>,
+            clog(C, match, "~s\"~s\"", [Context, lux_utils:to_string(Match)]),
+            case C#cstate.no_more_input of
+                true ->
+                    %% End of input
+                    stop(C, success, end_of_script);
+                false ->
+            clog(C, match, "~s\"~s\"", [Context, lux_utils:to_string(Match)]),
+                    C2 = C#cstate{actual = Rest},
+                    send_reply(C2, C2#cstate.parent,
+                               {break_stack, self(), Pos, Stack}),
+                    {C2, Pos#cmd_pos{break_cmd = undefined}} % No more match
+            end;
+        nomatch ->
+            {C, Pos};
+        {{'EXIT', Reason}, _} ->
+            RegExp = extract_regexp(Cmd#cmd.arg),
+            Err = io_lib:format("Bad regexp:\n\t~p\n"
+                                "Reason:\n\t~p\n",
+                                [RegExp, Reason]),
+            stop(C, error, iolist_to_binary(Err))
+    end;
+do_match_break_pattern(C, Pos, _Stack) ->
+    {C, Pos}.
 
 prepare_stop(C, Actual, [{First, TotLen} | _], Context) ->
     {Skip, Rest} = split_binary(Actual, First),
@@ -858,7 +939,7 @@ match(Actual, #pattern{cmd = Cmd}) -> % success or fail pattern
     match(Actual, Cmd);
 match(Actual, #cmd{type = Type, arg = Arg}) ->
     if
-        Type =:= expect; Type =:= fail; Type =:= success ->
+        Type =:= expect; Type =:= fail; Type =:= success; Type =:= break ->
             case Arg of
                 {verbatim, _RegExpOper, Expected} ->
                     {lux_utils:verbatim_match(Actual, Expected), single};
@@ -1126,8 +1207,10 @@ wait_for_down(C, Res) ->
         {sync, From, When} ->
             C2 = opt_sync_reply(C, From, When),
             wait_for_down(C2, Res);
-        {switch_cmd, From, _When, NewCmd, CmdStack, Fun} ->
-            C2 = switch_cmd(C, From, NewCmd, CmdStack, Fun),
+        {switch_cmd, From, _When, NewCmd, CmdStack,
+         NewBreakCmd, NewRevCmdFile, Fun} ->
+            C2 = switch_cmd(C, From, NewCmd, CmdStack,
+                            NewBreakCmd, NewRevCmdFile, Fun),
             wait_for_down(C2, Res);
         {change_mode, From, Mode, Cmd, CmdStack}
           when Mode =:= resume; Mode =:= suspend ->

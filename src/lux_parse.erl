@@ -319,6 +319,7 @@ parse_oper(P, Fd, LineNo, OrigLine) ->
     case OrigLine of
         <<"!",      D/binary>> -> {send,              lf,        D};
         <<"~",      D/binary>> -> {send,              nolf,      D};
+        <<"++",     D/binary>> -> {break,             regexp,    D};
         <<"?++",    D/binary>> -> {expect_add_strict, regexp,    D};
         <<"?+",     D/binary>> -> {expect_add,        regexp,    D};
         <<"???",    D/binary>> -> {expect,            verbatim,  D};
@@ -347,6 +348,8 @@ parse_single(#cmd{type = Type, arg = SubType} = Cmd, Data) ->
         fail                       -> parse_regexp(Cmd, SubType, Data,  single);
         success when Data =:= <<>> -> parse_regexp(Cmd, SubType, reset, single);
         success                    -> parse_regexp(Cmd, SubType, Data,  single);
+        break when Data =:= <<>>   -> parse_regexp(Cmd, SubType, reset, single);
+        break                      -> parse_regexp(Cmd, SubType, Data,  single);
 %%      meta                       -> Cmd;
 %%      multi                      -> Cmd;
         comment                    -> Cmd

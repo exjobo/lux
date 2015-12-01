@@ -30,16 +30,21 @@
          health :: alive | zombie,
          vars   :: [string()]}). % ["name=val"]
 
+-record(break_cmd,
+       {shell_name  :: string(),
+        cmd         :: #cmd{}}).
+
 -record(cmd_pos,
         {rev_file   :: [string()],
          lineno     :: non_neg_integer(),
-         type       :: atom()}).
+         type       :: atom(),
+         break_cmd  :: undefined | #break_cmd{}}).
 
 -record(result,
         {outcome       :: fail | success | shutdown,
          name          :: string(),
          latest_cmd    :: #cmd{},
-         cmd_stack     :: [{string(), non_neg_integer(), atom()}],
+         cmd_stack     :: [#cmd_pos{}],
          expected      :: binary() | atom(),
          extra         :: undefined | atom() | binary(),
          actual        :: binary() | atom(),
@@ -105,7 +110,8 @@
          commands                   :: [#cmd{}],
          orig_commands              :: [#cmd{}],
          macros = []                :: [#macro{}],
-         cmd_stack = []             :: [{string(), non_neg_integer(), atom()}],
+         cmd_stack = []             :: [#cmd_pos{}],
+         break_cmd                  :: undefined | #break_cmd{},
          submatch_vars = []         :: [string()],   % ["name=val"]
          macro_vars = []            :: [string()],   % ["name=val"]
          global_vars = []           :: [string()],   % ["name=val"]

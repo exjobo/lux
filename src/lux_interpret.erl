@@ -658,6 +658,11 @@ interpret_loop(I) ->
         {submatch_vars, _From, SubVars} ->
             I2 = I#istate{submatch_vars = SubVars},
             interpret_loop(I2);
+        {break_stack, _From, Pos, Stack} ->
+            io:format("\nBREAK_STACK ~p"
+                      "\n~p\n",
+                      [Pos, Stack]),
+            interpret_loop(I);
         {'DOWN', _, process, Pid, Reason} ->
             I2 = prepare_stop(I, Pid, {'EXIT', Reason}),
             interpret_loop(I2);
@@ -824,6 +829,13 @@ dispatch_cmd(I,
         success when is_tuple(Arg) ->
             Cmd2 = compile_regexp(I, Cmd, Arg),
             shell_eval(I#istate{latest_cmd = Cmd2}, Cmd2);
+        break when is_atom(Arg) ->
+            shell_eval(I#istate{break_cmd = undefined}, Cmd);
+        break when is_tuple(Arg) ->
+            Cmd2 = compile_regexp(I, Cmd, Arg),
+            BreakCmd = #break_cmd{shell_name = I#istate.active_name,
+                                  cmd        = Cmd2},
+            shell_eval(I#istate{break_cmd = BreakCmd}, Cmd2);
         sleep ->
             Secs = parse_int(I, Arg, Cmd),
             Cmd2 = Cmd#cmd{arg = Secs},
@@ -946,7 +958,7 @@ quote_val(IoList) ->
 
 shell_eval(I, Cmd) ->
     dlog(I, ?dmore, "want_more=false (send ~p)", [Cmd#cmd.type]),
-    cast(I, {eval, self(), Cmd}),
+    cast(I, Cmd, {eval, self(), Cmd}),
     I#istate{want_more = false}.
 
 eval_include(OldI, InclLineNo, FirstLineNo, LastLineNo,
@@ -958,40 +970,52 @@ eval_include(OldI, InclLineNo, FirstLineNo, LastLineNo,
 get_eval_fun() ->
     fun(I) when is_record(I, istate) -> interpret_loop(I) end.
 
-eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, CmdFile, Body,
-          #cmd{type = Type} = Cmd, Fun) ->
+eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile, Body,
+          #cmd{type = Type} = Cmd, BodyFun) ->
     lux_utils:progress_write(OldI#istate.progress, "("),
     Enter =
         fun() ->
                 ilog(OldI, "file_enter ~p ~p ~p ~p\n",
-                     [InvokeLineNo, FirstLineNo, LastLineNo, CmdFile])
+                     [InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile])
         end,
     OldStack = OldI#istate.cmd_stack,
+    OldBreakCmd = OldI#istate.break_cmd,
+    OldRevCmdFile = lux_utils:filename_split(OldI#istate.file),
+    NewRevCmdFile = lux_utils:filename_split(NewCmdFile),
     CurrentPos =
-        #cmd_pos{rev_file = lux_utils:filename_split(CmdFile),
+        #cmd_pos{rev_file = NewRevCmdFile,
                  lineno = InvokeLineNo,
-                 type = Type},
+                 type = Type,
+                 break_cmd = OldBreakCmd},
     NewStack = [CurrentPos | OldStack],
+    NewBreakCmd = undefined,
     BeforeI = OldI#istate{call_level = call_level(OldI) + 1,
-                          file = CmdFile,
+                          file = NewCmdFile,
                           latest_cmd = Cmd,
                           cmd_stack = NewStack,
+                          break_cmd = NewBreakCmd,
                           commands = Body},
-    BeforeI2 = switch_cmd(before, BeforeI, NewStack, Cmd, Enter),
+    BeforeI2 = switch_cmd(before, BeforeI, NewStack, Cmd,
+                          NewBreakCmd, NewRevCmdFile, Enter),
+    io:format("\nSAVE_STACK ~p"
+              "\n           ~p\n",
+              [CurrentPos, OldStack]),
     try
-        AfterI = Fun(BeforeI2),
+        AfterI = BodyFun(BeforeI2),
         lux_utils:progress_write(AfterI#istate.progress, ")"),
         AfterExit =
             fun() ->
                     catch ilog(AfterI, "file_exit ~p ~p ~p ~p\n",
                                [InvokeLineNo, FirstLineNo, LastLineNo,
-                                CmdFile])
+                                NewCmdFile])
             end,
-        AfterI2 = switch_cmd('after', AfterI, OldStack, Cmd, AfterExit),
+        AfterI2 = switch_cmd('after', AfterI, OldStack, Cmd,
+                             OldBreakCmd, OldRevCmdFile, AfterExit),
         NewI = AfterI2#istate{call_level = call_level(OldI),
                               file = OldI#istate.file,
                               latest_cmd = OldI#istate.latest_cmd,
                               cmd_stack = OldI#istate.cmd_stack,
+                              break_cmd = OldBreakCmd,
                               commands = OldI#istate.commands},
         if
             NewI#istate.cleanup_reason =:= normal ->
@@ -1011,14 +1035,10 @@ eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, CmdFile, Body,
                 fun() ->
                         catch ilog(BeforeI2, "file_exit ~p ~p ~p ~p\n",
                                    [InvokeLineNo, FirstLineNo, LastLineNo,
-                                    CmdFile])
+                                    NewCmdFile])
                 end,
-            if
-                Class =:= throw, element(1, Reason) =:= error ->
-                    BeforeExit();
-                true ->
-                    switch_cmd('after2', BeforeI2, OldStack, Cmd, BeforeExit)
-            end,
+            _ = switch_cmd('after2', BeforeI2, OldStack, Cmd,
+                           OldBreakCmd, OldRevCmdFile, BeforeExit),
             erlang:raise(Class, Reason, erlang:get_stacktrace())
     end.
 
@@ -1377,9 +1397,10 @@ multicast(Shells, Msg) when is_list(Shells) ->
     Send = fun(#shell{pid = Pid} = S) -> trace_msg(S, Msg), Pid ! Msg, Pid end,
     lists:map(Send, Shells).
 
-cast(#istate{active_shell = undefined} = I, _Msg) ->
+cast(#istate{active_shell = undefined} = I, Cmd, _Msg) ->
+    ilog(I, "lux(~p): ~p \n", [Cmd#cmd.lineno, Cmd#cmd.type]),
     throw_error(I, <<"The command must be executed in context of a shell">>);
-cast(#istate{active_shell = #shell{pid =Pid}, active_name = Name}, Msg) ->
+cast(#istate{active_shell = #shell{pid =Pid}, active_name = Name}, _Cmd, Msg) ->
     trace_msg(#shell{name=Name}, Msg),
     Pid ! Msg,
     Pid.
@@ -1510,19 +1531,20 @@ inactivate_shell(#istate{active_shell = ActiveShell, shells = Shells} = I,
 
 change_active_mode(I, Cmd, NewMode)
   when is_pid(I#istate.active_shell#shell.pid) ->
-    Pid = cast(I, {change_mode, self(), NewMode, Cmd, I#istate.cmd_stack}),
+    Pid = cast(I, Cmd, {change_mode, self(), NewMode, Cmd, I#istate.cmd_stack}),
     wait_for_reply(I, [Pid], change_mode_ack, undefined, infinity);
 change_active_mode(I, _Cmd, _NewMode) ->
     %% No active shell
     I.
 
 switch_cmd(_When, #istate{active_shell = undefined} = I,
-           _CmdStack, _NewCmd, Fun) ->
+           _CmdStack, _NewCmd, _NewBreakCmd, _NewRevCmdFile, Fun) ->
     Fun(),
     I;
 switch_cmd(When, #istate{active_shell = #shell{pid = Pid}} = I,
-           CmdStack, NewCmd, Fun) ->
-    Pid = cast(I, {switch_cmd, self(), When, NewCmd, CmdStack, Fun}),
+           CmdStack, NewCmd, NewBreakCmd, NewRevCmdFile, Fun) ->
+    Pid = cast(I, NewCmd, {switch_cmd, self(), When, NewCmd, CmdStack,
+                   NewBreakCmd, NewRevCmdFile, Fun}),
     wait_for_reply(I, [Pid], switch_cmd_ack, Fun, infinity).
 
 shell_crashed(I, Pid, Reason) when Pid =:= I#istate.active_shell#shell.pid ->
