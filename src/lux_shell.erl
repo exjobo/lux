@@ -527,7 +527,6 @@ shell_eval(#cstate{name = Name} = C0,
             clog(C, break, "pattern ~p", [lux_utils:to_string(RegExp)]),
             BreakCmd = #break_cmd{shell_name = C#cstate.name, cmd = Cmd},
             BreakPos = break_pos(C#cstate.rev_file, BreakCmd),
-            io:format("\nBREAK ~p\n", [BreakPos]),
             C#cstate{state_changed = true, break_pos = BreakPos};
         sleep ->
             Secs = Arg,
@@ -882,7 +881,6 @@ do_match_break_pattern(C, Pos, Stack)
                     %% End of input
                     stop(C, success, end_of_script);
                 false ->
-            clog(C, match, "~s\"~s\"", [Context, lux_utils:to_string(Match)]),
                     C2 = C#cstate{actual = Rest},
                     send_reply(C2, C2#cstate.parent,
                                {break_stack, self(), Pos, Stack}),

@@ -659,9 +659,19 @@ interpret_loop(I) ->
             I2 = I#istate{submatch_vars = SubVars},
             interpret_loop(I2);
         {break_stack, _From, Pos, Stack} ->
-            io:format("\nBREAK_STACK ~p"
-                      "\n~p\n",
-                      [Pos, Stack]),
+            io:format("\nBREAK STACK"
+                      "\n\tpos ~p"
+                      "\n\tstk ~p"
+                      "\n\tcur ~p"
+                      "\n\teq  ~p"
+                      "\n\t ===> ~p\n",
+                      [Pos, Stack, I#istate.cmd_stack,
+                       Stack =:= I#istate.cmd_stack,
+                       lists:suffix(Stack, I#istate.cmd_stack)]),
+            case lists:suffix(Stack, I#istate.cmd_stack) of
+                true  -> throw({break_stack, Pos, Stack, I});
+                false -> ok
+            end,
             interpret_loop(I);
         {'DOWN', _, process, Pid, Reason} ->
             I2 = prepare_stop(I, Pid, {'EXIT', Reason}),
@@ -971,7 +981,7 @@ get_eval_fun() ->
     fun(I) when is_record(I, istate) -> interpret_loop(I) end.
 
 eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile, Body,
-          #cmd{type = Type} = Cmd, BodyFun) ->
+          #cmd{type = Type} = BodyCmd, BodyFun) ->
     lux_utils:progress_write(OldI#istate.progress, "("),
     Enter =
         fun() ->
@@ -991,44 +1001,32 @@ eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile, Body,
     NewBreakCmd = undefined,
     BeforeI = OldI#istate{call_level = call_level(OldI) + 1,
                           file = NewCmdFile,
-                          latest_cmd = Cmd,
+                          latest_cmd = BodyCmd,
                           cmd_stack = NewStack,
                           break_cmd = NewBreakCmd,
                           commands = Body},
-    BeforeI2 = switch_cmd(before, BeforeI, NewStack, Cmd,
+    BeforeI2 = switch_cmd(before, BeforeI, NewStack, BodyCmd,
                           NewBreakCmd, NewRevCmdFile, Enter),
-    io:format("\nSAVE_STACK ~p"
-              "\n           ~p\n",
+    CallLevel = call_level(OldI),
+    io:format("\nPUSH STACK"
+              "\n\t~p"
+              "\n\t~p\n",
               [CurrentPos, OldStack]),
     try
         AfterI = BodyFun(BeforeI2),
-        lux_utils:progress_write(AfterI#istate.progress, ")"),
-        AfterExit =
-            fun() ->
-                    catch ilog(AfterI, "file_exit ~p ~p ~p ~p\n",
-                               [InvokeLineNo, FirstLineNo, LastLineNo,
-                                NewCmdFile])
-            end,
-        AfterI2 = switch_cmd('after', AfterI, OldStack, Cmd,
-                             OldBreakCmd, OldRevCmdFile, AfterExit),
-        NewI = AfterI2#istate{call_level = call_level(OldI),
-                              file = OldI#istate.file,
-                              latest_cmd = OldI#istate.latest_cmd,
-                              cmd_stack = OldI#istate.cmd_stack,
-                              break_cmd = OldBreakCmd,
-                              commands = OldI#istate.commands},
-        if
-            NewI#istate.cleanup_reason =:= normal ->
-                %% Everything OK - no cleanup needed
-                NewI;
-            OldI#istate.cleanup_reason =:= normal ->
-                %% New cleanup initiated in body - continue on this call level
-                goto_cleanup(NewI, NewI#istate.cleanup_reason);
-            true ->
-                %% Already cleaning up when we started eval of body
-                NewI
-        end
+        io:format("\nDONE"
+                  "\n\t~p"
+                  "\n\t~p\n",
+                  [CurrentPos, OldStack]),
+        after_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile,
+                   AfterI, CurrentPos, OldStack, CallLevel,
+                   BodyCmd, OldBreakCmd, OldRevCmdFile)
     catch
+        throw:{break_stack, BreakPos, BreakStack, BreakI}
+          when BreakStack =:= NewStack ->
+            after_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile,
+                       BreakI, BreakPos, OldStack, CallLevel,
+                       BodyCmd, OldBreakCmd, OldRevCmdFile);
         Class:Reason ->
             lux_utils:progress_write(OldI#istate.progress, ")"),
             BeforeExit =
@@ -1037,9 +1035,44 @@ eval_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile, Body,
                                    [InvokeLineNo, FirstLineNo, LastLineNo,
                                     NewCmdFile])
                 end,
-            _ = switch_cmd('after2', BeforeI2, OldStack, Cmd,
+            _ = switch_cmd('after2', BeforeI2, OldStack, BodyCmd,
                            OldBreakCmd, OldRevCmdFile, BeforeExit),
             erlang:raise(Class, Reason, erlang:get_stacktrace())
+    end.
+
+after_body(OldI, InvokeLineNo, FirstLineNo, LastLineNo, NewCmdFile,
+           BreakI, BreakPos, BreakStack, CallLevel,
+           BodyCmd, OldBreakCmd, OldRevCmdFile) ->
+    io:format("\nPOP STACK"
+              "\n\t~p"
+              "\n\t~p\n",
+              [BreakPos, BreakStack]),
+    lux_utils:progress_write(BreakI#istate.progress, ")"),
+    BreakExit =
+        fun() ->
+                catch ilog(BreakI, "file_exit ~p ~p ~p ~p\n",
+                           [InvokeLineNo, FirstLineNo, LastLineNo,
+                            NewCmdFile])
+        end,
+    BreakI2 = switch_cmd('after', BreakI, BreakStack, BodyCmd,
+                         OldBreakCmd, OldRevCmdFile, BreakExit),
+    NewI = BreakI2#istate{call_level = CallLevel,
+                          file = OldI#istate.file,
+                          latest_cmd = OldI#istate.latest_cmd,
+                          cmd_stack = BreakStack,
+                          break_cmd = OldBreakCmd,
+                          commands = OldI#istate.commands},
+    if
+        NewI#istate.cleanup_reason =:= normal ->
+            %% Everything OK - no cleanup needed
+            NewI;
+        OldI#istate.cleanup_reason =:= normal ->
+            %% New cleanup initiated in body -
+            %% continue on this call level
+            goto_cleanup(NewI, NewI#istate.cleanup_reason);
+        true ->
+            %% Already cleaning up when we started eval of body
+            NewI
     end.
 
 call_level(#istate{call_level = CallLevel}) ->
@@ -1073,10 +1106,10 @@ invoke_macro(I,
 
     BeforeI = I#istate{macro_vars = MacroVars, latest_cmd = InvokeCmd},
     DefaultFun = get_eval_fun(),
-    AfterI = eval_body(BeforeI, LineNo, FirstLineNo,
+    BreakI = eval_body(BeforeI, LineNo, FirstLineNo,
                        LastLineNo, File, Body, MacroCmd, DefaultFun),
 
-    AfterI#istate{macro_vars = OldMacroVars};
+    BreakI#istate{macro_vars = OldMacroVars};
 invoke_macro(I, #cmd{arg = {invoke, Name, _Values}}, []) ->
     BinName = list_to_binary(Name),
     throw_error(I, <<"No such macro: ", BinName/binary>>);
