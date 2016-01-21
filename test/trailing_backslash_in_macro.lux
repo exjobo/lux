@@ -1,0 +1,21 @@
+[doc Multiline regexp with trailing backslashes]
+
+[macro match]
+    !echo foo
+    ?f\
+oo
+    ?f\
+    \
+      oo
+[endmacro]
+
+[shell bar]
+    !echo bar
+    ?b\
+ar
+    ?b\
+    \
+      ar
+
+[shell foo]
+    [invoke match]
