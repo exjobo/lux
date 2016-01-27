@@ -1,0 +1,43 @@
+[shell single]
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?abcdefgih
+
+[shell multi]
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?++def
+    ?++gih
+    ?abc
+
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?++abc
+    ?++def
+    ?gih
+
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?++gih
+    ?++def
+    ?abc
+
+[shell relax]
+    !echo xxxabc111def222gihyyy
+    ?echo xxxabc111def222gihyyy
+    ?+def
+    ?+gih
+    ?abc
+
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?+abc
+    ?+def
+    ?gih
+
+[shell strict]
+    !echo xxxabcdefgihyyy
+    ?echo xxxabcdefgihyyy
+    ?++gih
+    ?++def
+    ?abc
