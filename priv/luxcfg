@@ -1,4 +1,7 @@
 # This is a -*- lux -*- file.
 
 # Put default values for all system architectures here
-
+[config var=MAKE=make]
+[config var=TAILFSKIP_MACOS=true]
+[config var=POLL_ON_STDIN_BROKEN=true]
+[config var=USE_VALGRIND=false]
