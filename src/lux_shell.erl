@@ -832,7 +832,8 @@ prepare_stop(C, Actual, [{First, TotLen} | _], Context) ->
     clog(C, skip, "\"~s\"", [lux_utils:to_string(Skip)]),
     clog(C, match, "~s\"~s\"", [Context, lux_utils:to_string(Match)]),
     C2 = C#cstate{expected = undefined, actual = Actual},
-    Actual2 = <<Context/binary, "\"", Match/binary, "\"">>,
+    Match2 = lux_utils:normalize_newlines(Match),
+    Actual2 = <<Context/binary, "\"", Match2/binary, "\"">>,
     dlog(C2, ?dmore, "expected=[] (prepare_stop)", []),
     C3 = opt_late_sync_reply(C2),
     {C3, Actual2}.
